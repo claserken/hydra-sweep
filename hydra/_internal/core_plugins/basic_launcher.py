@@ -16,6 +16,7 @@ from hydra.core.utils import (
 )
 from hydra.plugins.launcher import Launcher
 from hydra.types import HydraContext, TaskFunction
+from multiprocessing import Process, Queue
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,16 @@ class BasicLauncher(Launcher):
         self.config = config
         self.hydra_context = hydra_context
         self.task_function = task_function
+    
+    def run_job_process(self, hydra_context, task_function, sweep_config, queue):
+        ret = run_job(
+            hydra_context=hydra_context,
+            task_function=task_function,
+            config=sweep_config,
+            job_dir_key="hydra.sweep.dir",
+            job_subdir_key="hydra.sweep.subdir",
+        )
+        queue.put(ret)
 
     def launch(
         self, job_overrides: Sequence[Sequence[str]], initial_job_idx: int
@@ -61,6 +72,7 @@ class BasicLauncher(Launcher):
         Path(str(sweep_dir)).mkdir(parents=True, exist_ok=True)
         log.info(f"Launching {len(job_overrides)} jobs locally")
         runs: List[JobReturn] = []
+        queue = Queue()
         for idx, overrides in enumerate(job_overrides):
             idx = initial_job_idx + idx
             lst = " ".join(filter_overrides(overrides))
@@ -71,13 +83,16 @@ class BasicLauncher(Launcher):
             with open_dict(sweep_config):
                 sweep_config.hydra.job.id = idx
                 sweep_config.hydra.job.num = idx
-            ret = run_job(
-                hydra_context=self.hydra_context,
-                task_function=self.task_function,
-                config=sweep_config,
-                job_dir_key="hydra.sweep.dir",
-                job_subdir_key="hydra.sweep.subdir",
+            
+            # Create a new process for each run
+            process = Process(
+                target=self.run_job_process,
+                args=(self.hydra_context, self.task_function, sweep_config, queue),
             )
+            process.start()
+            process.join()
+            ret = queue.get()
+
             runs.append(ret)
             configure_log(self.config.hydra.hydra_logging, self.config.hydra.verbose)
         return runs
